@@ -23,6 +23,7 @@ import pandas as pd
 import streamlit as st
 
 import features as F
+import models as M
 import polygon_client as pc
 
 st.set_page_config(page_title="Agentic AlgoTrading — Behavior Dashboard",
@@ -157,8 +158,9 @@ st.success(f"Loaded {len(panel)} tickers at the **{loaded_horizon}** horizon.")
 # Tabs
 # ----------------------------------------------------------------------
 
-tab_screen, tab_name, tab_regime, tab_risk, tab_breadth = st.tabs([
+tab_screen, tab_ai, tab_name, tab_regime, tab_risk, tab_breadth = st.tabs([
     "🏆 Screener (durable core)",
+    "🤖 AI Predictions",
     "🔍 Single-name signals",
     "🌡️ Regime dial",
     "🛡️ Risk & sizing",
@@ -194,6 +196,100 @@ with tab_screen:
             "⚠️ Failure mode (per doc): breadth is illusory if names are "
             "correlated — check the **Effective breadth** tab before "
             "trusting this ranking's diversification.")
+
+# ------------------------ AI Predictions ------------------------------
+with tab_ai:
+    st.subheader("Signal Engine — ML conditional return forecaster")
+    st.markdown(
+        "Gradient-boosted stand-in for the system's BiLSTM-Transformer "
+        "Signal Engine. Trained **walk-forward with an embargo gap** (no "
+        "look-ahead, purged per López de Prado). Per the doc: expect "
+        "**52–55% hit rates and tiny R² — that is success, not failure** "
+        "(Gu-Kelly-Xiu 2020); the money comes from conviction-weighted "
+        "sizing, not frequency.")
+
+    k_fwd = st.slider("Prediction horizon (bars ahead)", 1, 21, 5,
+                      help="Target = forward k-bar return at the loaded sleeve horizon.")
+    if st.button("🧠 Train model & predict", type="primary"):
+        with st.spinner("Walk-forward training across the universe…"):
+            st.session_state["ai_result"] = M.train_and_predict(panel, k_forward=k_fwd)
+
+    res = st.session_state.get("ai_result")
+    if res and not res["predictions"].empty:
+        met = res["metrics"]
+        if met:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("OOS rank IC", f"{met['oos_rank_ic']:.3f}",
+                      help="Spearman correlation of predictions vs realized "
+                           "forward returns, out of sample. 0.02–0.05 is "
+                           "respectable; via IR ≈ IC·√breadth it compounds.")
+            c2.metric("OOS hit rate", f"{met['oos_hit_rate'] * 100:.1f}%",
+                      help="Directional accuracy out of sample. 52–56% is "
+                           "genuinely excellent per the doc.")
+            c3.metric("OOS R²", f"{met['oos_r2'] * 100:.2f}%",
+                      help="Gu-Kelly-Xiu: ~0.3–0.7% monthly OOS R² is a triumph.")
+            c4.metric("Test observations", f"{met['n_test']:,}")
+            if met["oos_rank_ic"] <= 0:
+                st.error("⚠️ Non-positive out-of-sample IC: the model shows "
+                         "NO measured edge on this universe/horizon. Per the "
+                         "doc's discipline, do not size positions from these "
+                         "predictions.")
+        else:
+            st.warning("Test window too small for honest OOS metrics — "
+                       "widen the universe or use a longer-history horizon.")
+
+        preds = res["predictions"].copy()
+        preds["implied_win_prob"] = preds["conviction"].apply(
+            lambda c: M.implied_win_prob(c, met.get("oos_hit_rate") if met else None))
+        show = preds.copy()
+        show["pred_fwd_return"] = (show["pred_fwd_return"] * 100).round(2)
+        show["implied_win_prob"] = (show["implied_win_prob"] * 100).round(1)
+        show.columns = ["Ticker", "Pred fwd return %", "Conviction [-1,1]",
+                        "Direction", "Implied win prob % (capped 56)"]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("Feed the implied win probability into the **Risk & sizing** "
+                   "tab's Kelly calculator — it is conservatively capped so an "
+                   "overconfident model cannot induce overbetting.")
+
+        with st.expander("Feature importances (what the model leans on)"):
+            st.bar_chart(res["importances"])
+            st.caption("⚠️ Failure mode: a model trained in one regime learns "
+                       "'buy dips' and is destroyed by the first sustained "
+                       "bear. Retrain after regime shifts; distrust stability.")
+
+        with st.expander("🤖 Optional: Claude Bull/Bear analyst (Layer 4 debate)"):
+            st.markdown(
+                "Adversarial debate grounded ONLY in the computed numbers — "
+                "no fabricated catalysts. **Caveat from the doc:** two prompts "
+                "to one model are not two independent analysts; treat this as "
+                "a de-biasing aid, never independent confirmation.")
+            anth_key = st.text_input("Anthropic API key", type="password")
+            sel_ai = st.selectbox("Name to debate", preds["ticker"].tolist())
+            if st.button("Run Bull/Bear debate") and anth_key:
+                row = preds[preds["ticker"] == sel_ai].iloc[0]
+                dfx = panel[sel_ai]
+                ctx = {
+                    "horizon": loaded_horizon,
+                    "pred_fwd_return_pct": round(row["pred_fwd_return"] * 100, 2),
+                    "conviction": row["conviction"],
+                    "momentum_pct": round(F.ts_momentum(dfx["close"],
+                                          min(mom_lb, len(dfx) - 2)) * 100, 2),
+                    "realized_vol_ann_pct": round(F.realized_vol(
+                        dfx["close"], 21, loaded_horizon) * 100, 1),
+                    "regime": F.classify_regime(dfx["close"], loaded_horizon)["regime"],
+                    "oos_model_hit_rate": met.get("oos_hit_rate") if met else None,
+                }
+                try:
+                    with st.spinner("Running adversarial debate…"):
+                        debate = M.llm_bull_bear(sel_ai, ctx, anth_key)
+                    st.markdown(f"**🐂 Bull case:** {debate['bull']}")
+                    st.markdown(f"**🐻 Bear case:** {debate['bear']}")
+                    st.info(f"**Calibration:** {debate['calibration']}")
+                except Exception as e:
+                    st.error(f"Debate failed: {e}")
+    else:
+        st.info("Click **Train model & predict** to fit the forecaster on the "
+                "loaded universe.")
 
 # ------------------------ Single name --------------------------------
 with tab_name:
